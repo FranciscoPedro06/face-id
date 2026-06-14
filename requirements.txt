@@ -1,0 +1,11 @@
+fastapi==0.104.1
+uvicorn==0.24.0
+python-multipart==0.0.6
+numpy==1.23.5
+pillow==10.0.1
+deepface==0.0.79
+torch==2.0.1
+torchvision==0.15.2
+opencv-python-headless==4.6.0.66
+setuptools==68.2.2
+wheel
