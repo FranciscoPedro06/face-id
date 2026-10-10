@@ -1,0 +1,15 @@
+# Segredos — nunca versionar
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Bancos e arquivos temporários locais
+*.db
+*.sqlite3
+temp_*.jpg
