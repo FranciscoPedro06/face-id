@@ -1,18 +1,29 @@
-from fastapi import FastAPI, File, UploadFile, Form
+from fastapi import FastAPI, File, UploadFile, Form, Header, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from deepface import DeepFace
 import numpy as np
 import uuid
 import os
-from datetime import datetime
-from supabase import create_client, Client
+import tempfile
 import logging
+from supabase import create_client, Client
 
 # -------------------------------
-# CONFIGURAÇÃO SUPABASE
+# CONFIGURAÇÃO (via variáveis de ambiente — nunca coloque chaves no código)
 # -------------------------------
-SUPABASE_URL = "https://ywwwcnolqehepqukbrdp.supabase.co"
-SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inl3d3djbm9scWVoZXBxdWticmRwIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjM1MTU2NzksImV4cCI6MjA3OTA5MTY3OX0.OXty613JpAwHxt1oFldArwDWhEMZrd8EO5SI0MhPFkI"   # ⚠️ coloque a service_role, não a anon!
+# SUPABASE_URL  -> URL do projeto Supabase
+# SUPABASE_KEY  -> chave do Supabase. Fica SÓ no servidor (Railway etc.), nunca no repositório.
+# API_KEY       -> (opcional) se definida, /cadastrar e /usuarios exigem o header X-API-Key
+# ALLOWED_ORIGINS -> sites que podem chamar a API, separados por vírgula (padrão: *)
+# MAX_UPLOAD_MB -> tamanho máximo da imagem enviada (padrão: 5)
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
+if not SUPABASE_URL or not SUPABASE_KEY:
+    raise RuntimeError("Defina as variáveis de ambiente SUPABASE_URL e SUPABASE_KEY.")
+
+API_KEY = os.environ.get("API_KEY", "")
+ALLOWED_ORIGINS = [o.strip() for o in os.environ.get("ALLOWED_ORIGINS", "*").split(",") if o.strip()]
+MAX_UPLOAD_BYTES = int(float(os.environ.get("MAX_UPLOAD_MB", "5")) * 1024 * 1024)
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
@@ -26,11 +37,42 @@ app = FastAPI(title="EduPass - Reconhecimento Facial")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
+    allow_origins=ALLOWED_ORIGINS,
+    # Credenciais (cookies) não são usadas por esta API; com "*" o navegador as recusaria de qualquer forma.
+    allow_credentials=False,
+    allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
+
+
+def exigir_api_key(x_api_key: str = Header(default="")):
+    """Protege rotas sensíveis quando API_KEY estiver definida no servidor."""
+    if API_KEY and x_api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="Não autorizado.")
+
+
+async def salvar_imagem_temporaria(file: UploadFile) -> str:
+    """Valida a imagem e grava num arquivo temporário seguro. Devolve o caminho."""
+    if not (file.content_type or "").startswith("image/"):
+        raise HTTPException(status_code=400, detail="Envie uma imagem válida.")
+
+    conteudo = await file.read(MAX_UPLOAD_BYTES + 1)
+    if len(conteudo) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="Imagem muito grande.")
+    if not conteudo:
+        raise HTTPException(status_code=400, detail="Imagem vazia.")
+
+    fd, temp_path = tempfile.mkstemp(suffix=".jpg")
+    with os.fdopen(fd, "wb") as f:
+        f.write(conteudo)
+    return temp_path
+
+
+def remover(path: str):
+    try:
+        os.remove(path)
+    except OSError:
+        pass
 
 # -----------------------------------------
 # ROTAS
@@ -45,16 +87,10 @@ async def health():
     return {"status": "online", "usuarios_cadastrados": total}
 
 
-@app.post("/cadastrar")
-async def cadastrar(nome: str = Form(...), file: UploadFile = File(...)):
+@app.post("/cadastrar", dependencies=[Depends(exigir_api_key)])
+async def cadastrar(nome: str = Form(..., max_length=120), file: UploadFile = File(...)):
 
-    if not file.content_type.startswith("image/"):
-        return {"success": False, "error": "Envie uma imagem válida."}
-
-    # Cria arquivo temporário
-    temp_path = f"temp_{uuid.uuid4()}.jpg"
-    with open(temp_path, "wb") as f:
-        f.write(await file.read())
+    temp_path = await salvar_imagem_temporaria(file)
 
     try:
         # Modelo de embedding
@@ -79,47 +115,49 @@ async def cadastrar(nome: str = Form(...), file: UploadFile = File(...)):
 
         supabase.table("usuarios_face").insert(data).execute()
 
-        os.remove(temp_path)
-
         return {
             "success": True,
             "mensagem": f"{nome} cadastrado com sucesso!",
             "id": user_id
         }
 
-    except Exception as e:
-        os.remove(temp_path)
-        return {"success": False, "error": str(e)}
+    except Exception:
+        # O detalhe vai só para o log do servidor, nunca para quem chamou a API.
+        logger.exception("Falha ao cadastrar rosto")
+        return {"success": False, "error": "Não foi possível cadastrar. Verifique se há um rosto nítido na foto."}
+
+    finally:
+        remover(temp_path)
 
 
 @app.post("/reconhecer")
 async def reconhecer(file: UploadFile = File(...)):
 
-    # Buscar embeddings
-    result = supabase.table("usuarios_face").select("*").execute()
-    usuarios = result.data
-
-    if not usuarios:
-        return {"success": False, "error": "Nenhum usuário cadastrado ainda."}
-
-    # Upload da imagem temporária
-    temp_path = f"temp_{uuid.uuid4()}.jpg"
-    with open(temp_path, "wb") as f:
-        f.write(await file.read())
+    temp_path = await salvar_imagem_temporaria(file)
 
     try:
-        embedding_obj = DeepFace.represent(
-            img_path=temp_path,
-            model_name="Facenet512",
-            detector_backend="opencv",
-            enforce_detection=True
-        )[0]
+        # Buscar embeddings
+        result = supabase.table("usuarios_face").select("id, nome, embedding").execute()
+        usuarios = result.data
 
-        embedding_atual = np.array(embedding_obj["embedding"])
+        if not usuarios:
+            return {"success": False, "error": "Nenhum usuário cadastrado ainda."}
 
-    except Exception:
-        os.remove(temp_path)
-        return {"success": False, "error": "Não foi detectado rosto."}
+        try:
+            embedding_obj = DeepFace.represent(
+                img_path=temp_path,
+                model_name="Facenet512",
+                detector_backend="opencv",
+                enforce_detection=True
+            )[0]
+
+            embedding_atual = np.array(embedding_obj["embedding"])
+
+        except Exception:
+            return {"success": False, "error": "Não foi detectado rosto."}
+
+    finally:
+        remover(temp_path)
 
     menor_dist = float("inf")
     usuario_final = None
@@ -137,8 +175,6 @@ async def reconhecer(file: UploadFile = File(...)):
             menor_dist = dist
             usuario_final = user
 
-    os.remove(temp_path)
-
     THRESHOLD = 0.35
 
     if menor_dist < THRESHOLD:
@@ -146,19 +182,20 @@ async def reconhecer(file: UploadFile = File(...)):
         return {
             "success": True,
             "mensagem": "Reconhecido",
-            "usuario": usuario_final,
-            "distancia": round(menor_dist, 4),
-            "confianca": round(confianca, 2)
+            # Nunca devolver o embedding (dado biométrico) — só o necessário.
+            "usuario": {"id": usuario_final["id"], "nome": usuario_final["nome"]},
+            "distancia": round(float(menor_dist), 4),
+            "confianca": round(float(confianca), 2)
         }
 
     return {
         "success": False,
         "mensagem": "Não reconhecido",
-        "distancia": round(menor_dist, 4)
+        "distancia": round(float(menor_dist), 4)
     }
 
 
-@app.get("/usuarios")
+@app.get("/usuarios", dependencies=[Depends(exigir_api_key)])
 async def usuarios():
     result = supabase.table("usuarios_face").select("id, nome, data_cadastro").execute()
 
